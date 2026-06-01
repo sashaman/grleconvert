@@ -12,6 +12,7 @@ struct LayerParams {
     layer_type: LayerType,
     num_channels: usize,
     compression_channels: Option<usize>, // For GDM with multiple ranges
+    type_index_channels: usize,          // header byte[13] flag (e.g. 7 for fruits); 0 normally
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -97,6 +98,7 @@ fn parse_i3d_for_file(i3d_path: &Path, target_filename: &str) -> Option<LayerPar
                     layer_type: LayerType::InfoLayer,
                     num_channels,
                     compression_channels: None,
+                    type_index_channels: 0,
                 });
             }
         }
@@ -113,6 +115,7 @@ fn parse_i3d_for_file(i3d_path: &Path, target_filename: &str) -> Option<LayerPar
                 layer_type: LayerType::GdmLayer,
                 num_channels,
                 compression_channels,
+                type_index_channels: 0,
             });
         }
     }
@@ -122,12 +125,14 @@ fn parse_i3d_for_file(i3d_path: &Path, target_filename: &str) -> Option<LayerPar
         if line.contains("<FoliageMultiLayer") && line.contains(&format!("densityMapId=\"{}\"", file_id)) {
             let num_channels = extract_attr(line, "numChannels")?;
             let compression_channels = extract_attr(line, "compressionChannels");
+            let type_index_channels = extract_attr(line, "numTypeIndexChannels").unwrap_or(0);
             eprintln!("Found FoliageMultiLayer with {} channels, compression: {:?} → GDM",
                      num_channels, compression_channels);
             return Some(LayerParams {
                 layer_type: LayerType::GdmLayer,
                 num_channels,
                 compression_channels,
+                type_index_channels,
             });
         }
     }
@@ -455,7 +460,7 @@ fn convert_gdm_to_png(input_path: &str, output_path: &str) -> Result<(), Box<dyn
         return Err("Not a valid GDM file".into());
     }
 
-    let (dimension, num_channels, chunk_size, num_compression_ranges, header_size) =
+    let (dimension, num_channels, chunk_size, num_compression_ranges, header_size, type_index_channels) =
         if magic == b"\"MDF" {
             let version = read_u32_le(&data, 4);
             if version != 0 {
@@ -466,11 +471,18 @@ fn convert_gdm_to_png(input_path: &str, output_path: &str) -> Result<(), Box<dyn
             let chunk_log2 = data[9] as usize;
             let num_channels = data[11] as usize;
             let num_compression_ranges = data[12] as usize;
+            // byte[13] is the type-index channel COUNT (a flag for the engine, e.g. 7
+            // for fruits). It does NOT add bytes to the file. The number of 3-byte
+            // channel-mapping records is byte[14] (verified against the official tool
+            // via Ghidra: data_start = header + boundaries + 3*byte[14], NOT 3*byte[13]).
+            // byte[14] is ~always 0, so fruits has zero mapping bytes and decodes as
+            // plain standard blocks.
+            let mapping_channels = data[14] as usize;
 
             let dimension = 1 << (dim_log2 + 5);
             let chunk_size = 1 << chunk_log2;
 
-            (dimension, num_channels, chunk_size, num_compression_ranges, 16usize)
+            (dimension, num_channels, chunk_size, num_compression_ranges, 16usize, mapping_channels)
         } else {
             let dim_log2 = data[4] as usize;
             let chunk_log2 = data[5] as usize;
@@ -480,7 +492,7 @@ fn convert_gdm_to_png(input_path: &str, output_path: &str) -> Result<(), Box<dyn
             let dimension = 1 << (dim_log2 + 5);
             let chunk_size = 1 << chunk_log2;
 
-            (dimension, num_channels, chunk_size, num_compression_ranges, 9usize)
+            (dimension, num_channels, chunk_size, num_compression_ranges, 9usize, 0usize)
         };
 
     eprintln!("GDM: {}x{}, {} channels, {} compression ranges",
@@ -503,7 +515,8 @@ fn convert_gdm_to_png(input_path: &str, output_path: &str) -> Result<(), Box<dyn
     let total_chunks = chunks_per_dim * chunks_per_dim;
 
     let compression_boundaries_size = if num_compression_ranges > 1 { num_compression_ranges - 1 } else { 0 };
-    let data_start = header_size + compression_boundaries_size;
+    let type_index_size = 3 * type_index_channels;
+    let data_start = header_size + compression_boundaries_size + type_index_size;
 
     let use_rgb = num_channels > 8;
 
@@ -584,7 +597,7 @@ fn convert_gdm_to_png(input_path: &str, output_path: &str) -> Result<(), Box<dyn
 // GDM Encoder
 // ============================================================================
 
-fn encode_gdm_block(pixels: &[u16], chunk_size: usize) -> Vec<u8> {
+fn encode_gdm_block(pixels: &[u16], chunk_size: usize, range_bits: usize) -> Vec<u8> {
     let total_pixels = chunk_size * chunk_size;
 
     // Find unique values in this chunk
@@ -637,9 +650,14 @@ fn encode_gdm_block(pixels: &[u16], chunk_size: usize) -> Vec<u8> {
 
         output.extend_from_slice(&bitmap);
     } else {
-        // Need higher bit depth - find max value to determine bits needed
+        // Raw (no palette). The GIANTS format stores these at the RANGE's full bit
+        // width (= number of channels in the range), NOT the minimum bits for the
+        // max value. Using fewer bits here desyncs the engine's decode and makes it
+        // read phantom values (e.g. corrupts densityMap_groundFoliage). Fall back to
+        // a max-value width only if the range width is somehow too small.
         let max_val = *unique_values.last().unwrap();
-        let bit_depth = (16 - max_val.leading_zeros()).max(1) as u8;
+        let min_bits = (16 - max_val.leading_zeros()).max(1) as usize;
+        let bit_depth = range_bits.max(min_bits) as u8;
 
         output.push(bit_depth);
         output.push(0u8); // No palette for high bit depths
@@ -752,8 +770,8 @@ fn convert_png_to_gdm(input_path: &str, output_path: &str, params: &LayerParams)
     output.push(2u8); // max_bpp (expected <= 2 for palette mode)
     output.push(num_channels as u8);
     output.push(num_compression_ranges as u8);
-    output.push(0u8); // type_index_channels
-    output.extend_from_slice(&[0u8; 2]); // padding to 16 bytes
+    output.push(params.type_index_channels as u8); // byte[13]: type-index flag (e.g. 7 for fruits)
+    output.extend_from_slice(&[0u8; 2]); // byte[14]=0 (mapping-byte count), byte[15]=0 padding
 
     // Compression boundaries (if more than 1 range)
     if num_compression_ranges > 1 {
@@ -791,7 +809,7 @@ fn convert_png_to_gdm(input_path: &str, output_path: &str, params: &LayerParams)
                 .map(|&v| ((v >> shift) & mask) as u16)
                 .collect();
 
-            let block = encode_gdm_block(&range_pixels, chunk_size);
+            let block = encode_gdm_block(&range_pixels, chunk_size, range_bits);
             output.extend_from_slice(&block);
 
             shift += range_bits;
@@ -845,6 +863,7 @@ fn main() {
     let mut i3d_path: Option<String> = None;
     let mut manual_channels: Option<usize> = None;
     let mut manual_compress_at: Option<usize> = None;
+    let mut manual_type_index: usize = 0;
 
     let mut i = 1;
     while i < args.len() {
@@ -865,6 +884,12 @@ fn main() {
                 i += 1;
                 if i < args.len() {
                     manual_compress_at = args[i].parse().ok();
+                }
+            }
+            "--type-index" => {
+                i += 1;
+                if i < args.len() {
+                    manual_type_index = args[i].parse().unwrap_or(0);
                 }
             }
             "--help" | "-h" => {
@@ -966,6 +991,7 @@ fn main() {
                             layer_type,
                             num_channels: channels,
                             compression_channels: manual_compress_at,
+                            type_index_channels: manual_type_index,
                         }
                     } else if explicit_grle {
                         // GRLE output explicitly requested - use default params
@@ -975,6 +1001,7 @@ fn main() {
                             layer_type: LayerType::InfoLayer,
                             num_channels: 1,
                             compression_channels: None,
+                            type_index_channels: 0,
                         }
                     } else {
                         eprintln!("Error: Could not find i3d file or determine encoding parameters.");
